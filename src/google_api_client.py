@@ -251,12 +251,10 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False) -> Resp
 
     final_post_data = json.dumps(final_payload)
 
-    # Send the request
+        # Send the request
     try:
         client = get_http_client()
         retryable_codes = {500, 502, 503, 504}
-        if not (GOOGLE_FALLBACK_TOKEN or "").strip():
-            retryable_codes.add(429)
         retry_cfg = RetryConfig(
             max_attempts=UPSTREAM_MAX_ATTEMPTS,
             base_delay_s=UPSTREAM_BACKOFF_BASE_S,
