@@ -4,6 +4,7 @@ This module is used by both OpenAI compatibility layer and native Gemini endpoin
 """
 import json
 import logging
+from datetime import datetime, timezone
 from fastapi import Response
 from fastapi.responses import StreamingResponse
 from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -13,10 +14,12 @@ from typing import Optional
 from .auth import get_credentials, save_credentials, get_user_project_id, onboard_user
 from .http_client import get_http_client
 from .http_retry import RetryConfig, post_with_retry, retry_after_seconds, sleep_before_retry
+from .upstream_quota_state import get_quota_block, record_upstream_429, format_duration
 from .utils import get_user_agent
 from .config import (
     CODE_ASSIST_ENDPOINT,
     DEFAULT_SAFETY_SETTINGS,
+    GOOGLE_FALLBACK_TOKEN,
     get_base_model_name,
     is_search_model,
     get_thinking_budget,
@@ -31,6 +34,139 @@ from .config import (
 import asyncio
 
 
+GOOGLE_AI_STUDIO_ENDPOINT = "https://generativelanguage.googleapis.com"
+_AI_STUDIO_ALLOWED_HARM_CATEGORIES = frozenset(
+    {
+        "HARM_CATEGORY_HARASSMENT",
+        "HARM_CATEGORY_HATE_SPEECH",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "HARM_CATEGORY_DANGEROUS_CONTENT",
+    }
+)
+
+
+def _ai_studio_model_path(model_name: Optional[str]) -> Optional[str]:
+    if not model_name:
+        return None
+    model_name = model_name.strip()
+    if not model_name:
+        return None
+    if not model_name.startswith("models/"):
+        model_name = f"models/{model_name}"
+    return model_name
+
+
+def _ai_studio_url(*, model_path: str, is_streaming: bool) -> str:
+    action = "streamGenerateContent" if is_streaming else "generateContent"
+    url = f"{GOOGLE_AI_STUDIO_ENDPOINT}/v1beta/{model_path}:{action}"
+    if is_streaming:
+        url += "?alt=sse"
+    return url
+
+
+def _ai_studio_headers(api_key: str) -> dict:
+    return {
+        "x-goog-api-key": api_key,
+        "Content-Type": "application/json",
+        "User-Agent": get_user_agent(),
+    }
+
+
+def _sanitize_ai_studio_request(request: dict) -> dict:
+    cleaned = dict(request or {})
+    safety_settings = cleaned.get("safetySettings")
+    if isinstance(safety_settings, list):
+        filtered: list[dict] = []
+        for item in safety_settings:
+            if not isinstance(item, dict):
+                continue
+            category = item.get("category")
+            threshold = item.get("threshold")
+            if category in _AI_STUDIO_ALLOWED_HARM_CATEGORIES and threshold:
+                filtered.append({"category": category, "threshold": threshold})
+        if filtered:
+            cleaned["safetySettings"] = filtered
+        else:
+            cleaned.pop("safetySettings", None)
+    return cleaned
+
+
+async def _send_ai_studio_request(payload: dict, is_streaming: bool) -> Response:
+    api_key = (GOOGLE_FALLBACK_TOKEN or "").strip()
+    model_path = _ai_studio_model_path(payload.get("model"))
+    if not api_key or not model_path:
+        return Response(
+            content=json.dumps({"error": {"message": "AI Studio fallback not configured.", "type": "api_error", "code": 500}}),
+            status_code=500,
+            media_type="application/json",
+        )
+
+    url = _ai_studio_url(model_path=model_path, is_streaming=is_streaming)
+    headers = _ai_studio_headers(api_key)
+    body = json.dumps(_sanitize_ai_studio_request(payload.get("request") or {}))
+    client = get_http_client()
+
+    if is_streaming:
+        async def stream_generator():
+            timeout = httpx.Timeout(timeout=None, connect=UPSTREAM_CONNECT_TIMEOUT_S, read=UPSTREAM_STREAM_READ_TIMEOUT_S)
+            async with client.stream("POST", url, headers=headers, content=body, timeout=timeout) as resp:
+                if resp.status_code != 200:
+                    body_text = ""
+                    try:
+                        body_text = await resp.aread()
+                        if isinstance(body_text, (bytes, bytearray)):
+                            body_text = body_text.decode("utf-8", "ignore")
+                    except Exception:
+                        body_text = ""
+                    error_message = f"Google AI Studio error: {resp.status_code}"
+                    try:
+                        error_data = json.loads(body_text) if body_text else {}
+                        if isinstance(error_data, dict) and "error" in error_data:
+                            error_message = (error_data.get("error") or {}).get("message", error_message)
+                    except Exception:
+                        pass
+                    yield f"data: {json.dumps({'error': {'message': error_message, 'type': 'api_error', 'code': resp.status_code}})}\n\n".encode(
+                        "utf-8", "ignore"
+                    )
+                    return
+
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    if not isinstance(line, str):
+                        line = line.decode("utf-8", "ignore")
+                    if not line.startswith("data: "):
+                        continue
+                    chunk = line[len("data: ") :].strip()
+                    if chunk == "[DONE]":
+                        return
+                    yield f"data: {chunk}\n\n".encode("utf-8", "ignore")
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+    timeout = httpx.Timeout(timeout=None, connect=UPSTREAM_CONNECT_TIMEOUT_S, read=UPSTREAM_READ_TIMEOUT_S)
+    resp = await client.post(url, headers=headers, content=body, timeout=timeout)
+    if resp.status_code == 200:
+        return Response(
+            content=resp.text,
+            status_code=200,
+            media_type="application/json; charset=utf-8",
+        )
+
+    error_message = f"Google AI Studio error: {resp.status_code}"
+    try:
+        error_data = resp.json()
+        if isinstance(error_data, dict) and "error" in error_data:
+            error_message = (error_data.get("error") or {}).get("message", error_message)
+    except Exception:
+        pass
+    return Response(
+        content=json.dumps({"error": {"message": error_message, "type": "api_error", "code": resp.status_code}}),
+        status_code=resp.status_code,
+        media_type="application/json",
+    )
+
+
 async def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
     """
     Send a request to Google's Gemini API.
@@ -42,6 +178,25 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False) -> Resp
     Returns:
         FastAPI Response object
     """
+    model_name = payload.get("model")
+    quota_block = get_quota_block(model_name)
+    if quota_block and (GOOGLE_FALLBACK_TOKEN or "").strip():
+        return await _send_ai_studio_request(payload, is_streaming=is_streaming)
+    if quota_block:
+        now = datetime.now(timezone.utc)
+        remaining = quota_block.next_available_at - now
+        error_message = (
+            "You have exhausted your capacity on this model. "
+            f"Your quota will reset after {format_duration(remaining)}."
+        )
+        headers = {"Retry-After": str(int(max(0, remaining.total_seconds())))}
+        return Response(
+            content=json.dumps({"error": {"message": error_message, "type": "api_error", "code": 429}}),
+            status_code=429,
+            media_type="application/json",
+            headers=headers,
+        )
+
     # Get and validate credentials
     creds = get_credentials()
     if not creds:
@@ -99,11 +254,14 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False) -> Resp
     # Send the request
     try:
         client = get_http_client()
+        retryable_codes = {500, 502, 503, 504}
+        if not (GOOGLE_FALLBACK_TOKEN or "").strip():
+            retryable_codes.add(429)
         retry_cfg = RetryConfig(
             max_attempts=UPSTREAM_MAX_ATTEMPTS,
             base_delay_s=UPSTREAM_BACKOFF_BASE_S,
             max_delay_s=UPSTREAM_BACKOFF_MAX_S,
-            retryable_status_codes=frozenset({429, 500, 502, 503, 504}),
+            retryable_status_codes=frozenset(retryable_codes),
         )
 
         if is_streaming:
@@ -113,6 +271,8 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False) -> Resp
                 request_headers=request_headers,
                 final_post_data=final_post_data,
                 retry_cfg=retry_cfg,
+                model_name=model_name,
+                original_payload=payload,
             )
         timeout = httpx.Timeout(timeout=None, connect=UPSTREAM_CONNECT_TIMEOUT_S, read=UPSTREAM_READ_TIMEOUT_S)
         resp = await post_with_retry(
@@ -123,6 +283,23 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False) -> Resp
             timeout=timeout,
             retry_config=retry_cfg,
         )
+        if resp.status_code == 429:
+            message = None
+            try:
+                error_data = resp.json()
+                if isinstance(error_data, dict):
+                    message = (error_data.get("error") or {}).get("message")
+            except Exception:
+                try:
+                    message = resp.text
+                except Exception:
+                    message = None
+            try:
+                record_upstream_429(model_name, message, retry_after_s=retry_after_seconds(resp.headers))
+            except Exception as e:
+                logging.warning(f"Failed to persist upstream quota state: {type(e).__name__}: {e}")
+            if (GOOGLE_FALLBACK_TOKEN or "").strip():
+                return await _send_ai_studio_request(payload, is_streaming=False)
         return _handle_non_streaming_response(resp)
     except httpx.RequestError as e:
         logging.error(f"Request to Google API failed: {str(e)}")
@@ -147,6 +324,8 @@ def _handle_streaming_response(
     request_headers: dict,
     final_post_data: str,
     retry_cfg: RetryConfig,
+    model_name: Optional[str],
+    original_payload: dict,
 ) -> StreamingResponse:
     """Handle streaming response from Google API."""
 
@@ -188,6 +367,26 @@ def _handle_streaming_response(
                             except Exception:
                                 pass
 
+                            if resp.status_code == 429:
+                                try:
+                                    record_upstream_429(model_name, error_message, retry_after_s=retry_after_seconds(resp.headers))
+                                except Exception as e:
+                                    logging.warning(f"Failed to persist upstream quota state: {type(e).__name__}: {e}")
+                                if (GOOGLE_FALLBACK_TOKEN or "").strip() and not started:
+                                    fallback = await _send_ai_studio_request(original_payload, is_streaming=True)
+                                    if isinstance(fallback, StreamingResponse):
+                                        async for b in fallback.body_iterator:
+                                            yield b
+                                    else:
+                                        try:
+                                            body = fallback.body
+                                            if isinstance(body, (bytes, bytearray)):
+                                                body = body.decode("utf-8", "ignore")
+                                            yield f"data: {body}\n\n".encode("utf-8", "ignore")
+                                        except Exception:
+                                            yield f"data: {json.dumps({'error': {'message': 'AI Studio fallback failed.', 'type': 'api_error', 'code': 500}})}\n\n".encode('utf-8','ignore')
+                                    return
+
                             if resp.status_code in retry_cfg.retryable_status_codes and attempt < retry_cfg.max_attempts:
                                 retry_after_s = retry_after_seconds(resp.headers)
                                 await sleep_before_retry(
@@ -218,6 +417,15 @@ def _handle_streaming_response(
                             chunk = line[len("data: ") :]
                             try:
                                 obj = json.loads(chunk)
+                                if isinstance(obj, dict) and "error" in obj:
+                                    err = obj.get("error") or {}
+                                    if err.get("code") == 429:
+                                        try:
+                                            record_upstream_429(model_name, err.get("message"))
+                                        except Exception as e:
+                                            logging.warning(
+                                                f"Failed to persist upstream quota state: {type(e).__name__}: {e}"
+                                            )
                                 if "response" in obj:
                                     response_chunk = obj["response"]
                                     response_json = json.dumps(response_chunk, separators=(",", ":"))

@@ -5,6 +5,9 @@ oauth_creds/
 # Environment configuration
 .env
 
+# Runtime state
+.upstream_quota_state.json
+
 # Python
 __pycache__/
 *.py[cod]

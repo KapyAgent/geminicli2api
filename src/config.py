@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     UPSTREAM_BACKOFF_MAX_S: float = 30.0
     UPSTREAM_MAX_CONNECTIONS: int = 100
     UPSTREAM_MAX_KEEPALIVE_CONNECTIONS: int = 20
+    UPSTREAM_QUOTA_STATE_FILE: str = Field(".upstream_quota_state.json")
     ONBOARD_POLL_INTERVAL_S: float = 2.5
     ONBOARD_MAX_WAIT_S: float = 90.0
 
@@ -58,6 +59,7 @@ class Settings(BaseSettings):
     # Authentication
     GEMINI_AUTH_PASSWORD: str = "123456"
     GEMINI_CREDENTIALS: Optional[str] = None
+    GOOGLE_FALLBACK_TOKEN: Optional[str] = None
 
     @field_validator("GOOGLE_APPLICATION_CREDENTIALS", mode="before")
     @classmethod
@@ -100,6 +102,7 @@ UPSTREAM_BACKOFF_BASE_S = settings.UPSTREAM_BACKOFF_BASE_S
 UPSTREAM_BACKOFF_MAX_S = settings.UPSTREAM_BACKOFF_MAX_S
 UPSTREAM_MAX_CONNECTIONS = settings.UPSTREAM_MAX_CONNECTIONS
 UPSTREAM_MAX_KEEPALIVE_CONNECTIONS = settings.UPSTREAM_MAX_KEEPALIVE_CONNECTIONS
+UPSTREAM_QUOTA_STATE_FILE = _resolve_project_path(settings.UPSTREAM_QUOTA_STATE_FILE)
 ONBOARD_POLL_INTERVAL_S = settings.ONBOARD_POLL_INTERVAL_S
 ONBOARD_MAX_WAIT_S = settings.ONBOARD_MAX_WAIT_S
 
@@ -113,6 +116,7 @@ SCOPES = settings.SCOPES
 
 # Authentication
 GEMINI_AUTH_PASSWORD = settings.GEMINI_AUTH_PASSWORD
+GOOGLE_FALLBACK_TOKEN = settings.GOOGLE_FALLBACK_TOKEN
 
 # File Paths
 # NOTE: `GOOGLE_APPLICATION_CREDENTIALS` is treated as a path to the OAuth credential JSON used by this proxy.
